@@ -31,83 +31,9 @@
 #include "support.h"
 #include "passverify.h"
 
-static char *
-search_key (const char *key, const char *filename)
-{
-  FILE *fp;
-  char *buf = NULL;
-  size_t buflen = 0;
-  char *retval = NULL;
-
-  fp = fopen (filename, "r");
-  if (NULL == fp)
-    return NULL;
-
-  while (!feof (fp))
-    {
-      char *tmp, *cp;
-#if defined(HAVE_GETLINE)
-      ssize_t n = getline (&buf, &buflen, fp);
-#elif defined (HAVE_GETDELIM)
-      ssize_t n = getdelim (&buf, &buflen, '\n', fp);
-#else
-      ssize_t n;
-
-      if (buf == NULL)
-        {
-          buflen = BUF_SIZE;
-          buf = malloc (buflen);
-	  if (buf == NULL) {
-	    fclose (fp);
-	    return NULL;
-	  }
-        }
-      buf[0] = '\0';
-      if (fgets (buf, buflen - 1, fp) == NULL)
-        break;
-      else if (buf != NULL)
-        n = strlen (buf);
-      else
-        n = 0;
-#endif /* HAVE_GETLINE / HAVE_GETDELIM */
-      cp = buf;
-
-      if (n < 1)
-        break;
-
-      tmp = strchr (cp, '#');  /* remove comments */
-      if (tmp)
-        *tmp = '\0';
-      while (isspace ((int)*cp))    /* remove spaces and tabs */
-        ++cp;
-      if (*cp == '\0')        /* ignore empty lines */
-        continue;
-
-      if (cp[strlen (cp) - 1] == '\n')
-        cp[strlen (cp) - 1] = '\0';
-
-      tmp = strsep (&cp, " \t=");
-      if (cp != NULL)
-        while (isspace ((int)*cp) || *cp == '=')
-          ++cp;
-
-      if (strcasecmp (tmp, key) == 0)
-        {
-          retval = strdup (cp);
-          break;
-        }
-    }
-  fclose (fp);
-
-  free (buf);
-
-  return retval;
-}
-
-
 /* this is a front-end for module-application conversations */
 
-int _make_remark(pam_handle_t * pamh, unsigned int ctrl,
+int _make_remark(pam_handle_t * pamh, unsigned long long ctrl,
 		    int type, const char *text)
 {
 	int retval = PAM_SUCCESS;
@@ -122,10 +48,11 @@ int _make_remark(pam_handle_t * pamh, unsigned int ctrl,
  * set the control flags for the UNIX module.
  */
 
-int _set_ctrl(pam_handle_t *pamh, int flags, int *remember, int *rounds,
-	      int *pass_min_len, int argc, const char **argv)
+unsigned long long _set_ctrl(pam_handle_t *pamh, int flags, int *remember,
+			     int *rounds, int *pass_min_len, int argc,
+			     const char **argv)
 {
-	unsigned int ctrl;
+	unsigned long long ctrl;
 	char *val;
 	int j;
 
@@ -153,7 +80,7 @@ int _set_ctrl(pam_handle_t *pamh, int flags, int *remember, int *rounds,
 	}
 
 	/* preset encryption method with value from /etc/login.defs */
-	val = search_key ("ENCRYPT_METHOD", LOGIN_DEFS);
+	val = pam_modutil_search_key(pamh, LOGIN_DEFS, "ENCRYPT_METHOD");
 	if (val) {
 	  for (j = 0; j < UNIX_CTRLS_; ++j) {
 	    if (unix_args[j].token && unix_args[j].is_hash_algo
@@ -171,10 +98,11 @@ int _set_ctrl(pam_handle_t *pamh, int flags, int *remember, int *rounds,
 
 	  /* read number of rounds for crypt algo */
 	  if (rounds && (on(UNIX_SHA256_PASS, ctrl) || on(UNIX_SHA512_PASS, ctrl))) {
-	    val=search_key ("SHA_CRYPT_MAX_ROUNDS", LOGIN_DEFS);
+	    val = pam_modutil_search_key(pamh, LOGIN_DEFS, "SHA_CRYPT_MAX_ROUNDS");
 
 	    if (val) {
 	      *rounds = strtol(val, NULL, 10);
+	      set(UNIX_ALGO_ROUNDS, ctrl);
 	      free (val);
 	    }
 	  }
@@ -242,23 +170,33 @@ int _set_ctrl(pam_handle_t *pamh, int flags, int *remember, int *rounds,
 		set(UNIX__NONULL, ctrl);
 	}
 
-	/* Set default rounds for blowfish */
-	if (on(UNIX_BLOWFISH_PASS, ctrl) && off(UNIX_ALGO_ROUNDS, ctrl) && rounds != NULL) {
-		*rounds = 5;
-		set(UNIX_ALGO_ROUNDS, ctrl);
+	/* Set default rounds for blowfish, gost-yescrypt and yescrypt */
+	if (off(UNIX_ALGO_ROUNDS, ctrl) && rounds != NULL) {
+		if (on(UNIX_BLOWFISH_PASS, ctrl) ||
+		    on(UNIX_GOST_YESCRYPT_PASS, ctrl) ||
+		    on(UNIX_YESCRYPT_PASS, ctrl)) {
+			*rounds = 5;
+			set(UNIX_ALGO_ROUNDS, ctrl);
+		}
 	}
 
 	/* Enforce sane "rounds" values */
 	if (on(UNIX_ALGO_ROUNDS, ctrl)) {
-		if (on(UNIX_BLOWFISH_PASS, ctrl)) {
+		if (on(UNIX_GOST_YESCRYPT_PASS, ctrl) ||
+		    on(UNIX_YESCRYPT_PASS, ctrl)) {
+			if (*rounds < 3 || *rounds > 11)
+				*rounds = 5;
+		} else if (on(UNIX_BLOWFISH_PASS, ctrl)) {
 			if (*rounds < 4 || *rounds > 31)
 				*rounds = 5;
 		} else if (on(UNIX_SHA256_PASS, ctrl) || on(UNIX_SHA512_PASS, ctrl)) {
-			if ((*rounds < 1000) || (*rounds == INT_MAX))
+			if ((*rounds < 1000) || (*rounds == INT_MAX)) {
 				/* don't care about bogus values */
+				*rounds = 0;
 				unset(UNIX_ALGO_ROUNDS, ctrl);
-			if (*rounds >= 10000000)
+			} else if (*rounds >= 10000000) {
 				*rounds = 9999999;
+			}
 		}
 	}
 
@@ -529,7 +467,7 @@ int _unix_comesfromsource(pam_handle_t *pamh,
 #include <sys/wait.h>
 
 static int _unix_run_helper_binary(pam_handle_t *pamh, const char *passwd,
-				   unsigned int ctrl, const char *user)
+				   unsigned long long ctrl, const char *user)
 {
     int retval, child, fds[2];
     struct sigaction newsa, oldsa;
@@ -655,7 +593,7 @@ static int _unix_run_helper_binary(pam_handle_t *pamh, const char *passwd,
  */
 
 int
-_unix_blankpasswd (pam_handle_t *pamh, unsigned int ctrl, const char *name)
+_unix_blankpasswd (pam_handle_t *pamh, unsigned long long ctrl, const char *name)
 {
 	struct passwd *pwd = NULL;
 	char *salt = NULL;
@@ -703,7 +641,7 @@ _unix_blankpasswd (pam_handle_t *pamh, unsigned int ctrl, const char *name)
 }
 
 int _unix_verify_password(pam_handle_t * pamh, const char *name
-			  ,const char *p, unsigned int ctrl)
+			  ,const char *p, unsigned long long ctrl)
 {
 	struct passwd *pwd = NULL;
 	char *salt = NULL;
@@ -758,7 +696,7 @@ int _unix_verify_password(pam_handle_t * pamh, const char *name
 			}
 		}
 	} else {
-		retval = verify_pwd_hash(p, salt, off(UNIX__NONULL, ctrl));
+		retval = verify_pwd_hash(pamh, p, salt, off(UNIX__NONULL, ctrl));
 	}
 
 	if (retval == PAM_SUCCESS) {
